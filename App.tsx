@@ -1,7 +1,12 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
 import { initialEvents, FestivalEvent, EventStatus } from './src/data';
 import { theme as c } from './src/theme';
+import { generateClient } from 'aws-amplify/data';
+import type { Schema } from './amplify/data/resource';
+import { backendConfigured } from './src/amplify';
+
+const client = generateClient<Schema>();
 
 type Page = 'dashboard' | 'events' | 'form';
 const stages = ['MAIN STAGE', 'GARDEN', 'WAREHOUSE', 'RIVER STAGE'];
@@ -42,17 +47,90 @@ export default function App() {
   const [status,setStatus] = useState<EventStatus>('CONFIRMED');
   const [notice,setNotice] = useState('');
 
+  useEffect(() => {
+    if (!backendConfigured) {
+      setNotice('Backend pendiente: ejecuta «npx ampx sandbox» para conectar la base de datos.');
+      return;
+    }
+
+    let active = true;
+    const loadEvents = async () => {
+      try {
+        const { data, errors } = await client.models.FestivalEvent.list();
+        if (errors?.length) throw new Error(errors[0].message);
+        let records = data;
+        if (records.length === 0) {
+          const seeded = await Promise.all(initialEvents.map((event) => client.models.FestivalEvent.create(event)));
+          const seedError = seeded.find((result) => result.errors?.length)?.errors?.[0];
+          if (seedError) throw new Error(seedError.message);
+          records = seeded.flatMap((result) => result.data ? [result.data] : []);
+        }
+        if (active) {
+          setEvents(records.map(({ id, artist, space, time, status }) => ({
+            id, artist, space, time, status: status as EventStatus,
+          })));
+          setNotice('Eventos sincronizados con la base de datos.');
+        }
+      } catch (error) {
+        if (active) setNotice(error instanceof Error ? `No se pudieron cargar los eventos: ${error.message}` : 'No se pudieron cargar los eventos.');
+      }
+    };
+    void loadEvents();
+    return () => { active = false; };
+  }, []);
+
   const filtered = useMemo(() => events.filter(e => (filter === 'TODOS' || e.space === filter) && (e.artist.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()))),[events,search,filter]);
   const openNew = () => {setEditing(null);setArtist('');setSpace(stages[0]);setTime('21:45');setStatus('CONFIRMED');setNotice('');setPage('form');};
   const openEdit = (e: FestivalEvent) => {setEditing(e.id);setArtist(e.artist);setSpace(e.space);setTime(e.time);setStatus(e.status);setNotice('');setPage('form');};
-  const save = () => {
+  const save = async () => {
     if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){setNotice('Introduce un artista y una hora válida (HH:MM).');return;}
-    if(editing){setEvents(v => v.map(e => e.id === editing ? {...e,artist:artist.trim().toUpperCase(),space,time,status} : e));setNotice('Evento actualizado (datos locales).');}
-    else {const id='EVT-'+Date.now().toString().slice(-7);setEvents(v=>[{id,artist:artist.trim().toUpperCase(),space,time,status},...v]);setNotice('Evento creado (datos locales).');}
-    setPage('events');
+    const normalizedArtist = artist.trim().toUpperCase();
+    const eventId = editing ?? `EVT-${Date.now().toString().slice(-7)}`;
+    try {
+      if (backendConfigured) {
+        if (editing) {
+          const { errors } = await client.models.FestivalEvent.update({ id: eventId, artist: normalizedArtist, space, time, status });
+          if (errors?.length) throw new Error(errors[0].message);
+        } else {
+          const { errors } = await client.models.FestivalEvent.create({ id: eventId, artist: normalizedArtist, space, time, status });
+          if (errors?.length) throw new Error(errors[0].message);
+        }
+      }
+      if(editing) setEvents(v => v.map(e => e.id === editing ? {...e,artist:normalizedArtist,space,time,status} : e));
+      else setEvents(v=>[{id:eventId,artist:normalizedArtist,space,time,status},...v]);
+      setNotice(editing ? (backendConfigured ? 'Evento actualizado en la base de datos.' : 'Evento actualizado en memoria local.') : (backendConfigured ? 'Evento creado en la base de datos.' : 'Evento creado en memoria local.'));
+      setPage('events');
+    } catch (error) {
+      setNotice(error instanceof Error ? `No se pudo guardar: ${error.message}` : 'No se pudo guardar el evento.');
+    }
   };
-  const changeStatus = (id:string) => {setEvents(v=>v.map(e=>e.id===id?{...e,status:e.status==='CONFIRMED'?'DELAYED':e.status==='DELAYED'?'CANCELLED':'CONFIRMED'}:e));setNotice('Estado actualizado localmente.');};
-  const remove = (id:string) => {setEvents(v=>v.filter(e=>e.id!==id));setNotice('Evento eliminado localmente.');};
+  const changeStatus = async (id:string) => {
+    const event = events.find(e => e.id === id);
+    if (!event) return;
+    const status: EventStatus = event.status === 'CONFIRMED' ? 'DELAYED' : event.status === 'DELAYED' ? 'CANCELLED' : 'CONFIRMED';
+    try {
+      if (backendConfigured) {
+        const { errors } = await client.models.FestivalEvent.update({ id, status });
+        if (errors?.length) throw new Error(errors[0].message);
+      }
+      setEvents(v=>v.map(e=>e.id===id?{...e,status}:e));
+      setNotice(backendConfigured ? 'Estado guardado en la base de datos.' : 'Estado actualizado en memoria local.');
+    } catch (error) {
+      setNotice(error instanceof Error ? `No se pudo cambiar el estado: ${error.message}` : 'No se pudo cambiar el estado.');
+    }
+  };
+  const remove = async (id:string) => {
+    try {
+      if (backendConfigured) {
+        const { errors } = await client.models.FestivalEvent.delete({ id });
+        if (errors?.length) throw new Error(errors[0].message);
+      }
+      setEvents(v=>v.filter(e=>e.id!==id));
+      setNotice(backendConfigured ? 'Evento eliminado de la base de datos.' : 'Evento eliminado de memoria local.');
+    } catch (error) {
+      setNotice(error instanceof Error ? `No se pudo eliminar: ${error.message}` : 'No se pudo eliminar el evento.');
+    }
+  };
   const confirmed = events.filter(e=>e.status==='CONFIRMED').length;
   const delayed = events.filter(e=>e.status==='DELAYED').length;
   return <SafeAreaView style={s.root}>
@@ -68,7 +146,7 @@ export default function App() {
       <View style={s.hero}>
         <Text style={s.heroTag}>ZARAGOZA · FESTIVAL OPERATIONS</Text>
         <Text style={[s.heroTitle,wide&&{fontSize:62}]}>THE NIGHT{ '\n' }IS YOURS.</Text>
-        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Demo interactiva sin backend.</Text>
+        <Text style={s.heroSub}>Gestiona la programación del festival y guarda los cambios en la nube.</Text>
       </View>
       {page==='dashboard' && <>
         <Text style={s.section}>PANEL DE CONTROL</Text>
@@ -92,7 +170,7 @@ export default function App() {
       </>}
       {page==='form' && <>
         <Text style={s.section}>{editing?'EDITAR EVENTO':'NUEVO EVENTO'}</Text>
-        <Text style={s.subtitle}>Completa los datos. Esta demo guarda los cambios sólo en memoria.</Text>
+        <Text style={s.subtitle}>Completa los datos para guardar el evento.</Text>
         <View style={s.form}>
           <Text style={s.label}>ARTISTA *</Text>
           <TextInput accessibilityLabel="Artista" placeholder="Ej. TECHNO TITANS" placeholderTextColor="#777" style={s.input} value={artist} onChangeText={setArtist}/>
@@ -107,7 +185,7 @@ export default function App() {
         </View>
       </>}
       {!!notice && <Text accessibilityRole="alert" style={s.notice}>{notice}</Text>}
-      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · FRONTEND DEMO · REACT NATIVE + EXPO</Text><Text style={s.footerText}>NO BACKEND · NO HTTP · NO PERSISTENCIA</Text></View>
+      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · REACT NATIVE + EXPO + AWS AMPLIFY</Text><Text style={s.footerText}>{backendConfigured ? 'API APPSYNC · DATOS EN DYNAMODB' : 'BACKEND PENDIENTE DE CONFIGURAR'}</Text></View>
     </ScrollView>
   </SafeAreaView>;
 }
